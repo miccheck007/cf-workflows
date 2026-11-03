@@ -5,8 +5,13 @@
 #   deploy    main -> production. Runs no repo code: a pinned Wrangler on build's output, with a
 #             token from the platform's broker, which checks this run's GitHub OIDC token (this
 #             workflow, the repo's manifest, main's head, merged from a reviewed PR)
-#   preview   pull requests -> a pr-<n> version on <name>-preview, same way; closed -> retired
-# Runtime secrets: GitHub secrets named WORKER_<NAME> ship as <NAME>; nothing else ever does.
+#   preview   pull requests -> a version with alias pr-<n> on the Worker itself (never deployed),
+#             same way; closed -> the alias answers 410
+# Uploads inherit from the Worker's *latest* version, which is often another PR's preview, so
+# nothing is left to inheritance: KV IDs come from the broker (production or _PREVIEW copies),
+# and previews are uploaded with an exact binding list (Wrangler would copy production's secrets
+# into them). Runtime secrets: GitHub secrets named WORKER_<NAME> ship as <NAME>; nothing else.
+# Every job revokes its token when done; the broker's cron deletes any a crashed job left.
 name: worker
 on:
   workflow_call:
@@ -25,7 +30,7 @@ jobs:
   build:
     if: >-
       github.event_name == 'push' || github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'pull_request' && vars.CFP_PREVIEW_WORKER != '' &&
+      (github.event_name == 'pull_request' && vars.CFP_PREVIEWS == 'true' &&
        github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
     permissions:
@@ -88,6 +93,7 @@ jobs:
       cancel-in-progress: false
     env:
       KIND: production
+      MODE: deploy
       MESSAGE: ${{ needs.build.outputs.subject }}
     steps:
       - &download
@@ -99,18 +105,41 @@ jobs:
         uses: actions/setup-node@v5
         with:
           node-version: "22"
+      - &token
+        name: Get a token from the broker
+        run: |
+          oidc=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$BROKER" | jq -r .value)
+          echo "::add-mask::$oidc"
+          resp=$(curl -sS -X POST "$BROKER/token" -H "Authorization: Bearer $oidc" -H "Content-Type: application/json" \
+            -d "{\"kind\":\"$KIND\"}" -w '\n%{http_code}')
+          code=${resp##*$'\n'}; body=${resp%$'\n'*}
+          if [ "$code" != 200 ]; then
+            echo "::error::The broker refused a $KIND token (HTTP $code): $(jq -r '.error // .' <<<"$body" 2>/dev/null || echo "$body")"
+            exit 1
+          fi
+          token=$(jq -r .token <<<"$body"); echo "::add-mask::$token"
+          jq -e '.kv and .secrets and .subdomain' <<<"$body" >/dev/null || { echo "::error::broker response lacks kv/secrets/subdomain"; exit 1; }
+          jq 'del(.token)' <<<"$body" > "$RUNNER_TEMP/broker.json"
+          { echo "CLOUDFLARE_API_TOKEN=$token"; echo "CLOUDFLARE_ACCOUNT_ID=$(jq -r .account_id <<<"$body")"
+            echo "WORKER=$(jq -r .worker <<<"$body")"; } >> "$GITHUB_ENV"
+          echo "Got a $KIND token for $(jq -r .worker <<<"$body"), expiring $(jq -r .expires_on <<<"$body")"
       - &prepare
-        name: Prepare the deploy directory
+        name: Prepare the upload
         env:
-          MODE: ${{ github.event.action == 'closed' && 'retire' || 'deploy' }}
           PR: ${{ github.event.pull_request.number }}
         run: |
-          mkdir -p "$RUNNER_TEMP/tools" && npm install --prefix "$RUNNER_TEMP/tools" --no-audit --no-fund "$WRANGLER" >/dev/null
+          if [ "$MODE" = deploy ]; then
+            mkdir -p "$RUNNER_TEMP/tools" && npm install --prefix "$RUNNER_TEMP/tools" --no-audit --no-fund "$WRANGLER" >/dev/null
+          fi
           node - <<'JS'
-          // Builds $RUNNER_TEMP/deploy from build's output: a config we write, the bundle, static
-          // assets. Nothing in it can run code here: no build commands, no .env, no symlinks.
+          // Builds $RUNNER_TEMP/deploy from build's output. Nothing in it can run code here: no
+          // build commands, no .env, no symlinks. deploy: wrangler.json for a pinned Wrangler.
+          // preview / retire: metadata.json + modules.json for the Versions API (exact bindings).
           const fs = require("fs"), path = require("path");
-          const pkg = path.join(process.env.RUNNER_TEMP, "pkg"), out = path.join(process.env.RUNNER_TEMP, "deploy");
+          const T = process.env.RUNNER_TEMP, mode = process.env.MODE;
+          const pkg = path.join(T, "pkg"), out = path.join(T, "deploy");
+          const broker = JSON.parse(fs.readFileSync(path.join(T, "broker.json"), "utf8"));
           const fail = (m) => { console.log(`::error::${m}`); process.exit(1); };
 
           function stripJsonc(text) { // comments and trailing commas, outside strings
@@ -126,28 +155,26 @@ jobs:
             }
             return s;
           }
-          function walk(dir, f) {
+          function walk(dir, f, base = dir) {
             for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
               const p = path.join(dir, e.name);
               if (e.isSymbolicLink()) fail(`symlinks aren't deployed: ${path.relative(pkg, p)}`);
-              if (e.isDirectory()) walk(p, f); else f(p);
+              if (e.isDirectory()) walk(p, f, base); else f(p, path.relative(base, p));
             }
           }
+          const kvId = (binding) => broker.kv[binding] ||
+            fail(`KV binding ${binding} isn't in this Worker's manifest (resources.kv in cf-platform)`);
 
           const cfg = JSON.parse(stripJsonc(fs.readFileSync(path.join(pkg, "config.jsonc"), "utf8")));
           const entry = path.basename(cfg.main || "index.js").replace(/\.[^.]+$/, "") + ".js";
           // Code-running, bundling and target keys: the platform decides these, not the repo.
           for (const k of ["build", "env", "containers", "name", "account_id", "routes", "route", "main", "dev",
                            "tsconfig", "alias", "define", "no_bundle", "find_additional_modules", "base_dir"]) delete cfg[k];
+          cfg.kv_namespaces = (cfg.kv_namespaces || []).map((k) => ({ binding: k.binding, id: kvId(k.binding) }));
           fs.mkdirSync(path.join(out, "bundle"), { recursive: true });
+          const bundle = path.join(pkg, "bundle");
 
-          if (process.env.MODE === "retire") { // bindings stay, so later previews still inherit them
-            fs.writeFileSync(path.join(out, "bundle", "index.js"), `export default { fetch: () => new Response(` +
-              `"The preview for PR #${Number(process.env.PR)} is closed.", { status: 410 }) };\n`);
-            delete cfg.assets;
-            Object.assign(cfg, { main: "./bundle/index.js", no_bundle: true });
-          } else {
-            const bundle = path.join(pkg, "bundle");
+          if (mode === "deploy") {
             if (!fs.existsSync(path.join(bundle, entry))) fail(`bundle has no ${entry}`);
             walk(bundle, () => {});
             fs.cpSync(bundle, path.join(out, "bundle"), { recursive: true });
@@ -159,28 +186,58 @@ jobs:
               cfg.assets.directory = "./assets";
             }
             Object.assign(cfg, { main: `./bundle/${entry}`, no_bundle: true, find_additional_modules: true, base_dir: "./bundle" });
+            fs.writeFileSync(path.join(out, "wrangler.json"), JSON.stringify(cfg, null, 2));
+            console.log(`deploying ${cfg.main}; settings from wrangler.jsonc: ${Object.keys(cfg).sort().join(", ")}`);
+            process.exit(0);
           }
-          fs.writeFileSync(path.join(out, "wrangler.json"), JSON.stringify(cfg, null, 2));
-          console.log(`deploying ${cfg.main} with bindings/settings from wrangler.jsonc: ${Object.keys(cfg).sort().join(", ")}`);
+
+          // Previews: only what can be bound without touching production's data.
+          const unsupported = ["durable_objects", "migrations", "d1_databases", "r2_buckets", "queues", "assets", "workflows",
+            "hyperdrive", "vectorize", "dispatch_namespaces", "mtls_certificates", "send_email", "pipelines",
+            "secrets_store_secrets", "images", "unsafe", "tail_consumers", "wasm_modules", "text_blobs", "data_blobs"]
+            .filter((k) => cfg[k] !== undefined && !(Array.isArray(cfg[k]) && !cfg[k].length));
+          if (mode === "preview" && unsupported.length) fail(`previews don't support ${unsupported.join(", ")} yet`);
+
+          const bindings = [];
+          for (const [name, v] of Object.entries(cfg.vars || {})) {
+            bindings.push(typeof v === "string" ? { type: "plain_text", name, text: v } : { type: "json", name, json: v });
+          }
+          for (const k of cfg.kv_namespaces) bindings.push({ type: "kv_namespace", name: k.binding, namespace_id: k.id });
+          for (const s of cfg.services || []) {
+            bindings.push({ type: "service", name: s.binding, service: s.service, ...(s.entrypoint && { entrypoint: s.entrypoint }) });
+          }
+          for (const d of cfg.analytics_engine_datasets || []) bindings.push({ type: "analytics_engine", name: d.binding, dataset: d.dataset || d.binding });
+          for (const [key, type] of [["ai", "ai"], ["version_metadata", "version_metadata"], ["browser", "browser"]]) {
+            if (cfg[key]?.binding) bindings.push({ type, name: cfg[key].binding });
+          }
+
+          const types = { js: "application/javascript+module", mjs: "application/javascript+module", wasm: "application/wasm",
+                          txt: "text/plain", html: "text/plain", sql: "text/plain", bin: "application/octet-stream" };
+          const modules = [];
+          let main = entry;
+          if (mode === "retire") {
+            main = "index.js";
+            fs.writeFileSync(path.join(out, "bundle", main), `export default { fetch: () => new Response(` +
+              `"The preview for PR #${Number(process.env.PR)} is closed.", { status: 410 }) };\n`);
+            modules.push({ name: main, type: types.js });
+            bindings.length = 0;
+          } else {
+            if (!fs.existsSync(path.join(bundle, entry))) fail(`bundle has no ${entry}`);
+            walk(bundle, (p, rel) => {
+              const type = types[path.extname(rel).slice(1)];
+              if (!type) return; // source maps, READMEs
+              fs.mkdirSync(path.dirname(path.join(out, "bundle", rel)), { recursive: true });
+              fs.copyFileSync(p, path.join(out, "bundle", rel));
+              modules.push({ name: rel, type });
+            });
+          }
+          const metadata = { main_module: main, compatibility_date: cfg.compatibility_date || "2026-10-01",
+                             compatibility_flags: cfg.compatibility_flags || [], bindings,
+                             ...(cfg.placement && { placement: cfg.placement }), ...(cfg.limits && { limits: cfg.limits }) };
+          fs.writeFileSync(path.join(out, "metadata.json"), JSON.stringify(metadata));
+          fs.writeFileSync(path.join(out, "modules.json"), JSON.stringify(modules));
+          console.log(`preview ${main} with ${modules.length} module(s); bindings: ${bindings.map((b) => `${b.name} (${b.type})`).join(", ") || "none"}`);
           JS
-      - &token
-        name: Get a token from the broker
-        run: |
-          oidc=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$BROKER" | jq -r .value)
-          echo "::add-mask::$oidc"
-          resp=$(curl -sS -X POST "$BROKER/token" -H "Authorization: Bearer $oidc" -H "Content-Type: application/json" \
-            -d "{\"kind\":\"$KIND\"}" -w '\n%{http_code}')
-          code=${resp##*$'\n'}; body=${resp%$'\n'*}
-          if [ "$code" != 200 ]; then
-            echo "::error::The broker refused a $KIND token (HTTP $code): $(jq -r '.error // .' <<<"$body" 2>/dev/null || echo "$body")"
-            exit 1
-          fi
-          token=$(jq -r .token <<<"$body"); echo "::add-mask::$token"
-          jq '.secrets' <<<"$body" > "$RUNNER_TEMP/expected.json"
-          { echo "CLOUDFLARE_API_TOKEN=$token"; echo "CLOUDFLARE_ACCOUNT_ID=$(jq -r .account_id <<<"$body")"
-            echo "WORKER=$(jq -r .worker <<<"$body")"; } >> "$GITHUB_ENV"
-          echo "Got a $KIND token for $(jq -r .worker <<<"$body"), expiring $(jq -r .expires_on <<<"$body")"
       - &secrets
         name: Collect runtime secrets
         if: github.event.action != 'closed'
@@ -188,6 +245,7 @@ jobs:
           SECRETS: ${{ toJSON(secrets) }}
         run: |
           # Every WORKER_ secret GitHub has for this run (names from the broker) must be visible here.
+          jq '.secrets' "$RUNNER_TEMP/broker.json" > "$RUNNER_TEMP/expected.json"
           missing=$(jq -r --slurpfile want "$RUNNER_TEMP/expected.json" '$want[0] - keys | .[]' <<<"$SECRETS")
           [ -z "$missing" ] || { echo "::error::secrets not visible to the workflow: $missing"; exit 1; }
           jq --slurpfile want "$RUNNER_TEMP/expected.json" \
@@ -201,22 +259,28 @@ jobs:
           "$RUNNER_TEMP/tools/node_modules/.bin/wrangler" deploy --name "$WORKER" \
             --secrets-file "$RUNNER_TEMP/secrets.json" --message "$MESSAGE" --tag "${GITHUB_SHA::7}"
 
-      # --secrets-file only adds and updates; a WORKER_ secret deleted in GitHub goes here.
-      - name: Remove secrets deleted from GitHub
+      # --secrets-file only adds and updates (and a deploy inherits secrets from the latest version,
+      # maybe a preview's): anything not a WORKER_ secret of the production environment goes here.
+      - name: Remove secrets not in GitHub
         working-directory: ${{ runner.temp }}/deploy
         run: |
           wr="$RUNNER_TEMP/tools/node_modules/.bin/wrangler"
           "$wr" secret list --name "$WORKER" --format json \
             | jq -r --slurpfile keep "$RUNNER_TEMP/secrets.json" '.[].name | select(in($keep[0]) | not)' \
             | while read -r s; do
-                echo "Removing $s: no WORKER_$s secret in GitHub any more"
+                echo "Removing $s: no WORKER_$s secret in the production environment"
                 "$wr" secret delete "$s" --name "$WORKER"
               done
 
+      - &revoke
+        name: Revoke the token
+        if: always() && env.CLOUDFLARE_API_TOKEN != ''
+        run: |
+          curl -sS -X POST "$BROKER/revoke" -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN"; echo
       - &cleanup
         name: Clean up
         if: always()
-        run: rm -rf "$RUNNER_TEMP/secrets.json" "$RUNNER_TEMP/expected.json" "$RUNNER_TEMP/pkg" "$RUNNER_TEMP/deploy"
+        run: rm -rf "$RUNNER_TEMP/secrets.json" "$RUNNER_TEMP/expected.json" "$RUNNER_TEMP/broker.json" "$RUNNER_TEMP/pkg" "$RUNNER_TEMP/deploy"
 
   preview:
     needs: build
@@ -233,6 +297,7 @@ jobs:
       cancel-in-progress: true
     env:
       KIND: preview
+      MODE: ${{ github.event.action == 'closed' && 'retire' || 'preview' }}
       ALIAS: pr-${{ github.event.pull_request.number }}
       PR: ${{ github.event.pull_request.number }}
       TITLE: ${{ github.event.pull_request.title }}
@@ -240,20 +305,44 @@ jobs:
     steps:
       - *download
       - *node
-      - *prepare
       - *token
+      - *prepare
       - *secrets
       - name: Upload preview version
         id: upload
-        working-directory: ${{ runner.temp }}/deploy
         run: |
-          args=(); [ -f "$RUNNER_TEMP/secrets.json" ] && args=(--secrets-file "$RUNNER_TEMP/secrets.json")
-          if [ "${{ github.event.action }}" = closed ]; then msg="PR #$PR closed"
-          else msg=$(printf 'PR #%s: %s' "$PR" "$TITLE" | cut -c1-100); fi
-          out="$RUNNER_TEMP/wrangler.ndjson"
-          WRANGLER_OUTPUT_FILE_PATH="$out" "$RUNNER_TEMP/tools/node_modules/.bin/wrangler" versions upload \
-            --name "$WORKER" --preview-alias "$ALIAS" "${args[@]}" --message "$msg" --tag "${SHA::7}"
-          url=$(jq -r 'select(.type == "version-upload") | .preview_alias_url // empty' "$out" | tail -1)
-          echo "url=$url" >> "$GITHUB_OUTPUT"
-          echo "### Preview: $url" >> "$GITHUB_STEP_SUMMARY"
+          node - <<'JS'
+          // A version with alias pr-<n> and exactly these bindings: none inherited, so production's
+          // secrets never reach a preview. It is never deployed.
+          const fs = require("fs"), path = require("path");
+          const T = process.env.RUNNER_TEMP, D = path.join(T, "deploy"), e = process.env;
+          const broker = JSON.parse(fs.readFileSync(path.join(T, "broker.json"), "utf8"));
+          const meta = JSON.parse(fs.readFileSync(path.join(D, "metadata.json"), "utf8"));
+          const secretsFile = path.join(T, "secrets.json");
+          if (fs.existsSync(secretsFile)) {
+            for (const [name, text] of Object.entries(JSON.parse(fs.readFileSync(secretsFile, "utf8")))) {
+              meta.bindings.push({ type: "secret_text", name, text });
+            }
+          }
+          const closed = e.MODE === "retire";
+          meta.annotations = { "workers/alias": e.ALIAS, "workers/tag": e.SHA.slice(0, 7),
+                               "workers/message": (closed ? `PR #${e.PR} closed` : `PR #${e.PR}: ${e.TITLE}`).slice(0, 100) };
+          const form = new FormData();
+          form.set("metadata", JSON.stringify(meta));
+          for (const m of JSON.parse(fs.readFileSync(path.join(D, "modules.json"), "utf8"))) {
+            form.set(m.name, new File([fs.readFileSync(path.join(D, "bundle", m.name))], m.name, { type: m.type }));
+          }
+          (async () => {
+            const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${e.CLOUDFLARE_ACCOUNT_ID}/workers/scripts/${e.WORKER}/versions`,
+                                    { method: "POST", headers: { Authorization: `Bearer ${e.CLOUDFLARE_API_TOKEN}` }, body: form });
+            const j = await res.json();
+            if (!j.success) { console.log(`::error::version upload failed: ${JSON.stringify(j.errors)}`); process.exit(1); }
+            const url = `https://${e.ALIAS}-${e.WORKER}.${broker.subdomain}.workers.dev`;
+            console.log(`Version ${j.result.id} on ${e.WORKER}${closed ? " (preview retired)" : ""}: ${url}`);
+            console.log(`Bindings: ${meta.bindings.map((b) => `${b.name} (${b.type})`).join(", ") || "none"}`);
+            fs.appendFileSync(e.GITHUB_OUTPUT, `url=${closed ? "" : url}\n`);
+            fs.appendFileSync(e.GITHUB_STEP_SUMMARY, closed ? `### Preview for PR #${e.PR} retired\n` : `### Preview: ${url}\n`);
+          })();
+          JS
+      - *revoke
       - *cleanup
