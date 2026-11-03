@@ -5,12 +5,12 @@
 #   deploy    main -> production. Runs no repo code: a pinned Wrangler on build's output, with a
 #             token from the platform's broker, which checks this run's GitHub OIDC token (this
 #             workflow, the repo's manifest, main's head, merged from a reviewed PR)
-#   preview   pull requests -> a version with alias pr-<n> on the Worker itself (never deployed),
-#             same way; closed -> the alias answers 410
-# Uploads inherit from the Worker's *latest* version, which is often another PR's preview, so
-# nothing is left to inheritance: KV IDs come from the broker (production or _PREVIEW copies),
-# and previews are uploaded with an exact binding list (Wrangler would copy production's secrets
-# into them). Runtime secrets: GitHub secrets named WORKER_<NAME> ship as <NAME>; nothing else.
+#   preview   pull requests -> the Worker's Preview pr-<n> (`wrangler preview`), same way;
+#             closed -> the Preview is deleted
+# KV IDs come from the broker (production's, or the _PREVIEW copies) and are written into every
+# upload. A Preview takes its bindings only from the `previews` block, which is written here, and
+# inherits nothing from production. Runtime secrets: GitHub secrets named WORKER_<NAME> ship as
+# <NAME>; nothing else.
 # Every job revokes its token when done; the broker's cron deletes any a crashed job left.
 name: worker
 on:
@@ -129,13 +129,12 @@ jobs:
         env:
           PR: ${{ github.event.pull_request.number }}
         run: |
-          if [ "$MODE" = deploy ]; then
-            mkdir -p "$RUNNER_TEMP/tools" && npm install --prefix "$RUNNER_TEMP/tools" --no-audit --no-fund "$WRANGLER" >/dev/null
-          fi
+          mkdir -p "$RUNNER_TEMP/tools" "$RUNNER_TEMP/deploy"
+          npm install --prefix "$RUNNER_TEMP/tools" --no-audit --no-fund "$WRANGLER" >/dev/null
+          [ "$MODE" != delete ] || exit 0 # deleting a Preview needs no upload
           node - <<'JS'
-          // Builds $RUNNER_TEMP/deploy from build's output. Nothing in it can run code here: no
-          // build commands, no .env, no symlinks. deploy: wrangler.json for a pinned Wrangler.
-          // preview / retire: metadata.json + modules.json for the Versions API (exact bindings).
+          // Builds $RUNNER_TEMP/deploy/wrangler.json (plus bundle and assets) from build's output for
+          // a pinned Wrangler. Nothing in it can run code here: no build commands, no .env, no symlinks.
           const fs = require("fs"), path = require("path");
           const T = process.env.RUNNER_TEMP, mode = process.env.MODE;
           const pkg = path.join(T, "pkg"), out = path.join(T, "deploy");
@@ -167,76 +166,47 @@ jobs:
 
           const cfg = JSON.parse(stripJsonc(fs.readFileSync(path.join(pkg, "config.jsonc"), "utf8")));
           const entry = path.basename(cfg.main || "index.js").replace(/\.[^.]+$/, "") + ".js";
+          const previewVars = cfg.previews?.vars;
           // Code-running, bundling and target keys: the platform decides these, not the repo.
-          for (const k of ["build", "env", "containers", "name", "account_id", "routes", "route", "main", "dev",
+          for (const k of ["build", "env", "containers", "name", "account_id", "routes", "route", "main", "dev", "previews",
                            "tsconfig", "alias", "define", "no_bundle", "find_additional_modules", "base_dir"]) delete cfg[k];
           cfg.kv_namespaces = (cfg.kv_namespaces || []).map((k) => ({ binding: k.binding, id: kvId(k.binding) }));
-          fs.mkdirSync(path.join(out, "bundle"), { recursive: true });
+
           const bundle = path.join(pkg, "bundle");
+          if (!fs.existsSync(path.join(bundle, entry))) fail(`bundle has no ${entry}`);
+          walk(bundle, () => {});
+          fs.cpSync(bundle, path.join(out, "bundle"), { recursive: true });
+          if (cfg.assets?.directory) {
+            const src = path.resolve(pkg, "src", cfg.assets.directory);
+            if (!src.startsWith(path.join(pkg, "src") + path.sep)) fail("assets.directory must be inside the repo");
+            walk(src, () => {});
+            fs.cpSync(src, path.join(out, "assets"), { recursive: true });
+            cfg.assets.directory = "./assets";
+          }
+          Object.assign(cfg, { main: `./bundle/${entry}`, no_bundle: true, find_additional_modules: true, base_dir: "./bundle" });
 
-          if (mode === "deploy") {
-            if (!fs.existsSync(path.join(bundle, entry))) fail(`bundle has no ${entry}`);
-            walk(bundle, () => {});
-            fs.cpSync(bundle, path.join(out, "bundle"), { recursive: true });
-            if (cfg.assets?.directory) {
-              const src = path.resolve(pkg, "src", cfg.assets.directory);
-              if (!src.startsWith(path.join(pkg, "src") + path.sep)) fail("assets.directory must be inside the repo");
-              walk(src, () => {});
-              fs.cpSync(src, path.join(out, "assets"), { recursive: true });
-              cfg.assets.directory = "./assets";
-            }
-            Object.assign(cfg, { main: `./bundle/${entry}`, no_bundle: true, find_additional_modules: true, base_dir: "./bundle" });
-            fs.writeFileSync(path.join(out, "wrangler.json"), JSON.stringify(cfg, null, 2));
-            console.log(`deploying ${cfg.main}; settings from wrangler.jsonc: ${Object.keys(cfg).sort().join(", ")}`);
-            process.exit(0);
+          if (mode === "preview") {
+            // A Preview's bindings come only from this block: the same names, with KV IDs from the
+            // broker (the _PREVIEW copies), and nothing that would reach production's data.
+            const dos = cfg.durable_objects?.bindings || [];
+            const unsupported = ["d1_databases", "r2_buckets", "queues", "workflows", "hyperdrive", "vectorize",
+              "dispatch_namespaces", "mtls_certificates", "send_email", "pipelines", "secrets_store_secrets", "images",
+              "unsafe", "tail_consumers", "wasm_modules", "text_blobs", "data_blobs"]
+              .filter((k) => cfg[k] !== undefined && !(Array.isArray(cfg[k]) && !cfg[k].length));
+            if (dos.some((d) => d.script_name)) unsupported.push("durable_objects of other Workers");
+            if (unsupported.length) fail(`previews don't support ${unsupported.join(", ")} yet`);
+            cfg.previews = {
+              vars: previewVars ?? cfg.vars ?? {},
+              kv_namespaces: cfg.kv_namespaces,
+              // Durable Objects of this Worker get a fresh namespace in each Preview.
+              ...(dos.length && { durable_objects: { bindings: dos } }),
+              ...Object.fromEntries(["services", "analytics_engine_datasets", "ai", "version_metadata", "browser"]
+                .filter((k) => cfg[k] !== undefined).map((k) => [k, cfg[k]])),
+            };
           }
-
-          // Previews: only what can be bound without touching production's data.
-          const unsupported = ["durable_objects", "migrations", "d1_databases", "r2_buckets", "queues", "assets", "workflows",
-            "hyperdrive", "vectorize", "dispatch_namespaces", "mtls_certificates", "send_email", "pipelines",
-            "secrets_store_secrets", "images", "unsafe", "tail_consumers", "wasm_modules", "text_blobs", "data_blobs"]
-            .filter((k) => cfg[k] !== undefined && !(Array.isArray(cfg[k]) && !cfg[k].length));
-          if (mode === "preview" && unsupported.length) fail(`previews don't support ${unsupported.join(", ")} yet`);
-
-          const bindings = [];
-          for (const [name, v] of Object.entries(cfg.vars || {})) {
-            bindings.push(typeof v === "string" ? { type: "plain_text", name, text: v } : { type: "json", name, json: v });
-          }
-          for (const k of cfg.kv_namespaces) bindings.push({ type: "kv_namespace", name: k.binding, namespace_id: k.id });
-          for (const s of cfg.services || []) {
-            bindings.push({ type: "service", name: s.binding, service: s.service, ...(s.entrypoint && { entrypoint: s.entrypoint }) });
-          }
-          for (const d of cfg.analytics_engine_datasets || []) bindings.push({ type: "analytics_engine", name: d.binding, dataset: d.dataset || d.binding });
-          for (const [key, type] of [["ai", "ai"], ["version_metadata", "version_metadata"], ["browser", "browser"]]) {
-            if (cfg[key]?.binding) bindings.push({ type, name: cfg[key].binding });
-          }
-
-          const types = { js: "application/javascript+module", mjs: "application/javascript+module", wasm: "application/wasm",
-                          txt: "text/plain", html: "text/plain", sql: "text/plain", bin: "application/octet-stream" };
-          const modules = [];
-          let main = entry;
-          if (mode === "retire") {
-            main = "index.js";
-            fs.writeFileSync(path.join(out, "bundle", main), `export default { fetch: () => new Response(` +
-              `"The preview for PR #${Number(process.env.PR)} is closed.", { status: 410 }) };\n`);
-            modules.push({ name: main, type: types.js });
-            bindings.length = 0;
-          } else {
-            if (!fs.existsSync(path.join(bundle, entry))) fail(`bundle has no ${entry}`);
-            walk(bundle, (p, rel) => {
-              const type = types[path.extname(rel).slice(1)];
-              if (!type) return; // source maps, READMEs
-              fs.mkdirSync(path.dirname(path.join(out, "bundle", rel)), { recursive: true });
-              fs.copyFileSync(p, path.join(out, "bundle", rel));
-              modules.push({ name: rel, type });
-            });
-          }
-          const metadata = { main_module: main, compatibility_date: cfg.compatibility_date || "2026-10-01",
-                             compatibility_flags: cfg.compatibility_flags || [], bindings,
-                             ...(cfg.placement && { placement: cfg.placement }), ...(cfg.limits && { limits: cfg.limits }) };
-          fs.writeFileSync(path.join(out, "metadata.json"), JSON.stringify(metadata));
-          fs.writeFileSync(path.join(out, "modules.json"), JSON.stringify(modules));
-          console.log(`preview ${main} with ${modules.length} module(s); bindings: ${bindings.map((b) => `${b.name} (${b.type})`).join(", ") || "none"}`);
+          fs.writeFileSync(path.join(out, "wrangler.json"), JSON.stringify(cfg, null, 2));
+          const shown = mode === "preview" ? cfg.previews : cfg;
+          console.log(`${mode} ${cfg.main}; settings: ${Object.keys(shown).sort().join(", ")}`);
           JS
       - &secrets
         name: Collect runtime secrets
@@ -259,8 +229,8 @@ jobs:
           "$RUNNER_TEMP/tools/node_modules/.bin/wrangler" deploy --name "$WORKER" \
             --secrets-file "$RUNNER_TEMP/secrets.json" --message "$MESSAGE" --tag "${GITHUB_SHA::7}"
 
-      # --secrets-file only adds and updates (and a deploy inherits secrets from the latest version,
-      # maybe a preview's): anything not a WORKER_ secret of the production environment goes here.
+      # --secrets-file only adds and updates (a deploy inherits secrets from the latest version):
+      # anything not a WORKER_ secret of the production environment goes here.
       - name: Remove secrets not in GitHub
         working-directory: ${{ runner.temp }}/deploy
         run: |
@@ -280,7 +250,7 @@ jobs:
       - &cleanup
         name: Clean up
         if: always()
-        run: rm -rf "$RUNNER_TEMP/secrets.json" "$RUNNER_TEMP/expected.json" "$RUNNER_TEMP/broker.json" "$RUNNER_TEMP/pkg" "$RUNNER_TEMP/deploy"
+        run: rm -rf "$RUNNER_TEMP/secrets.json" "$RUNNER_TEMP/expected.json" "$RUNNER_TEMP/broker.json" "$RUNNER_TEMP/out.json" "$RUNNER_TEMP/pkg" "$RUNNER_TEMP/deploy"
 
   preview:
     needs: build
@@ -288,7 +258,7 @@ jobs:
     runs-on: ubuntu-latest
     environment:
       name: preview
-      url: ${{ steps.upload.outputs.url }}
+      url: ${{ steps.preview.outputs.url }}
     permissions:
       contents: read
       id-token: write # the OIDC token for the broker; no repo code runs in this job
@@ -297,8 +267,8 @@ jobs:
       cancel-in-progress: true
     env:
       KIND: preview
-      MODE: ${{ github.event.action == 'closed' && 'retire' || 'preview' }}
-      ALIAS: pr-${{ github.event.pull_request.number }}
+      MODE: ${{ github.event.action == 'closed' && 'delete' || 'preview' }}
+      PREVIEW: pr-${{ github.event.pull_request.number }}
       PR: ${{ github.event.pull_request.number }}
       TITLE: ${{ github.event.pull_request.title }}
       SHA: ${{ github.event.pull_request.head.sha }}
@@ -308,41 +278,31 @@ jobs:
       - *token
       - *prepare
       - *secrets
-      - name: Upload preview version
-        id: upload
+      # The Worker's Preview pr-<n>: listed under the Worker in the dashboard, with its own URL.
+      # --ignore-base-config: only this config and the preview environment's secrets apply, never
+      # settings edited in the dashboard.
+      - name: Deploy the Preview
+        id: preview
+        if: env.MODE == 'preview'
+        working-directory: ${{ runner.temp }}/deploy
         run: |
-          node - <<'JS'
-          // A version with alias pr-<n> and exactly these bindings: none inherited, so production's
-          // secrets never reach a preview. It is never deployed.
-          const fs = require("fs"), path = require("path");
-          const T = process.env.RUNNER_TEMP, D = path.join(T, "deploy"), e = process.env;
-          const broker = JSON.parse(fs.readFileSync(path.join(T, "broker.json"), "utf8"));
-          const meta = JSON.parse(fs.readFileSync(path.join(D, "metadata.json"), "utf8"));
-          const secretsFile = path.join(T, "secrets.json");
-          if (fs.existsSync(secretsFile)) {
-            for (const [name, text] of Object.entries(JSON.parse(fs.readFileSync(secretsFile, "utf8")))) {
-              meta.bindings.push({ type: "secret_text", name, text });
-            }
-          }
-          const closed = e.MODE === "retire";
-          meta.annotations = { "workers/alias": e.ALIAS, "workers/tag": e.SHA.slice(0, 7),
-                               "workers/message": (closed ? `PR #${e.PR} closed` : `PR #${e.PR}: ${e.TITLE}`).slice(0, 100) };
-          const form = new FormData();
-          form.set("metadata", JSON.stringify(meta));
-          for (const m of JSON.parse(fs.readFileSync(path.join(D, "modules.json"), "utf8"))) {
-            form.set(m.name, new File([fs.readFileSync(path.join(D, "bundle", m.name))], m.name, { type: m.type }));
-          }
-          (async () => {
-            const res = await fetch(`https://api.cloudflare.com/client/v4/accounts/${e.CLOUDFLARE_ACCOUNT_ID}/workers/scripts/${e.WORKER}/versions`,
-                                    { method: "POST", headers: { Authorization: `Bearer ${e.CLOUDFLARE_API_TOKEN}` }, body: form });
-            const j = await res.json();
-            if (!j.success) { console.log(`::error::version upload failed: ${JSON.stringify(j.errors)}`); process.exit(1); }
-            const url = `https://${e.ALIAS}-${e.WORKER}.${broker.subdomain}.workers.dev`;
-            console.log(`Version ${j.result.id} on ${e.WORKER}${closed ? " (preview retired)" : ""}: ${url}`);
-            console.log(`Bindings: ${meta.bindings.map((b) => `${b.name} (${b.type})`).join(", ") || "none"}`);
-            fs.appendFileSync(e.GITHUB_OUTPUT, `url=${closed ? "" : url}\n`);
-            fs.appendFileSync(e.GITHUB_STEP_SUMMARY, closed ? `### Preview for PR #${e.PR} retired\n` : `### Preview: ${url}\n`);
-          })();
-          JS
+          message="PR #$PR: $TITLE"
+          WRANGLER_OUTPUT_FILE_PATH="$RUNNER_TEMP/out.json" "$RUNNER_TEMP/tools/node_modules/.bin/wrangler" preview \
+            --name "$PREVIEW" --worker-name "$WORKER" --ignore-base-config \
+            --secrets-file "$RUNNER_TEMP/secrets.json" --message "${message:0:100}" --tag "${SHA::7}"
+          url=$(jq -rs 'map(select(.type == "preview")) | last | .preview_urls[0] // empty' "$RUNNER_TEMP/out.json")
+          echo "url=$url" >> "$GITHUB_OUTPUT"
+          echo "### Preview $PREVIEW: ${url:-no URL}" >> "$GITHUB_STEP_SUMMARY"
+      - name: Delete the Preview
+        if: env.MODE == 'delete'
+        working-directory: ${{ runner.temp }}/deploy
+        run: |
+          "$RUNNER_TEMP/tools/node_modules/.bin/wrangler" preview delete \
+            --name "$PREVIEW" --worker-name "$WORKER" --skip-confirmation && exit 0
+          # A PR opened before previews were on has none (10025); anything else is a real failure.
+          code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/workers/$WORKER/previews/$PREVIEW")
+          [ "$code" = 404 ] || exit 1
+          echo "No Preview $PREVIEW to delete"
       - *revoke
       - *cleanup
