@@ -287,7 +287,8 @@ jobs:
         working-directory: ${{ runner.temp }}/deploy
         run: |
           message="PR #$PR: $TITLE"
-          WRANGLER_OUTPUT_FILE_PATH="$RUNNER_TEMP/out.json" "$RUNNER_TEMP/tools/node_modules/.bin/wrangler" preview \
+          # GITHUB_SHA is GitHub's test merge on pull requests; the Preview runs the PR's head.
+          GITHUB_SHA="$SHA" WRANGLER_OUTPUT_FILE_PATH="$RUNNER_TEMP/out.json" "$RUNNER_TEMP/tools/node_modules/.bin/wrangler" preview \
             --name "$PREVIEW" --worker-name "$WORKER" --ignore-base-config \
             --secrets-file "$RUNNER_TEMP/secrets.json" --message "${message:0:100}" --tag "${SHA::7}"
           url=$(jq -rs 'map(select(.type == "preview")) | last | .preview_urls[0] // empty' "$RUNNER_TEMP/out.json")
