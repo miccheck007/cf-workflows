@@ -16,4 +16,5 @@ jobs:
   worker:
     uses: miccheck007/cf-workflows/.github/workflows/worker.yml@v1
     # Without it, environment secrets arrive empty in the shared workflow (GitHub behaviour).
+    # Only secrets named WORKER_* reach the Worker; the rest is never shipped.
     secrets: inherit

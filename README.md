@@ -7,15 +7,16 @@ to `.github/workflows/cloudflare.yml`. Onboarding, manifests and tokens are in
 
 | Event in the Worker repo | Job | Environment | Result |
 |---|---|---|---|
-| push to `main`, or *Run workflow* | `deploy` | `production` (main only) | `wrangler deploy` with the commit as message/tag, plus the environment's secrets |
+| push to `main`, or *Run workflow* | `deploy` | `production` (main only) | `wrangler deploy` with the commit as message/tag, plus the `WORKER_` secrets |
 | pull request opened / updated | `preview` | `preview` | version on `<name>-preview`, alias `pr-<n>`; URL on the PR's deployment |
 | pull request closed | `preview` | `preview` | the alias answers 410 (aliases can't be deleted) |
 
-**Secrets**: every secret in the Worker repo's `production` environment becomes a Worker secret of
-the same name on the next deploy; deleting one there deletes it from the Worker. `preview` works the
-same for previews. Names starting with `CFP_` are the platform's and never shipped. Keep Worker
-repos free of repository-level secrets: the caller has to pass `secrets: inherit` (environment
-secrets arrive empty otherwise), so those would be shipped to production and previews alike.
+**Secrets**: GitHub secrets named `WORKER_<NAME>` become the Worker secret `<NAME>` on the next
+deploy (`WORKER_API_KEY` -> `API_KEY`), and deleting one deletes it from the Worker. Put them in the
+repo's `production` environment; `preview` works the same for previews. Nothing else ships: the
+caller passes `secrets: inherit` (environment secrets arrive empty otherwise), so every repo and org
+secret reaches the workflow, and the prefix is what keeps them out of the Worker. A repository-level
+`WORKER_` secret ships to production *and* previews; the environment's value wins when both exist.
 
 This repo holds no secrets and no state. It is still security-critical: whatever `worker.yml` runs,
 runs with every Worker's deploy token. Changes go through review; callers pin `@v1`, which only

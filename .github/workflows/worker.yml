@@ -2,8 +2,11 @@
 # (caller/cloudflare.yml). It runs as the calling repo: its variables, its environments, its
 # GITHUB_TOKEN. This repo holds no secrets. cf-platform (reconcile.py) sets up what it reads:
 #   variables   CFP_WORKER, CLOUDFLARE_ACCOUNT_ID, CFP_ROOT_DIR, CFP_PREVIEW_WORKER (previews only)
-#   production  environment, main only: CFP_DEPLOY_TOKEN (this Worker only) + runtime secrets
-#   preview     environment, any branch: CFP_PREVIEW_TOKEN (the preview Worker only) + its secrets
+#   production  environment, main only: CFP_DEPLOY_TOKEN (this Worker only)
+#   preview     environment, any branch: CFP_PREVIEW_TOKEN (the preview Worker only)
+# Runtime secrets are the team's: only names starting with WORKER_ ship, without the prefix
+# (WORKER_API_KEY -> API_KEY). The caller passes `secrets: inherit`, so every repo and org secret
+# reaches this workflow; the prefix is what keeps the rest out of the Worker.
 # The tokens' scope is the boundary, not this file: a PR can edit its own caller, but only runs
 # on main get the production environment.
 name: worker
@@ -50,15 +53,15 @@ jobs:
           elif [ -f package.json ]; then npm install
           fi
 
-      # Every production environment secret except ours is a Worker secret, under the same name.
+      # WORKER_<NAME> secrets -> Worker secret <NAME>; the environment's value wins over the repo's.
       - name: Collect runtime secrets
         env:
           SECRETS: ${{ toJSON(secrets) }}
         run: |
           # Our own token proves the environment's secrets are visible; never ship (or prune) blind.
           jq -e 'has("CFP_DEPLOY_TOKEN")' <<<"$SECRETS" >/dev/null || { echo "::error::production secrets not visible"; exit 1; }
-          jq 'with_entries(select((.key | startswith("CFP_") | not) and .key != "github_token"))' <<<"$SECRETS" \
-            > "$RUNNER_TEMP/secrets.json"
+          jq 'with_entries(select(.key | startswith("WORKER_")) | .key |= ltrimstr("WORKER_") | select(.key != ""))' \
+            <<<"$SECRETS" > "$RUNNER_TEMP/secrets.json"
           echo "Shipping $(jq length "$RUNNER_TEMP/secrets.json") secret(s): $(jq -r 'keys | join(", ")' "$RUNNER_TEMP/secrets.json")"
 
       - name: Deploy
@@ -67,14 +70,14 @@ jobs:
           npx --yes wrangler deploy --name "$WORKER" --secrets-file "$RUNNER_TEMP/secrets.json" \
             --message "$(git log -1 --format=%s | cut -c1-100)" --tag "${GITHUB_SHA::7}"
 
-      # --secrets-file only adds and updates; a secret removed from the environment goes here.
+      # --secrets-file only adds and updates; a WORKER_ secret removed from GitHub goes here.
       - name: Remove secrets deleted from GitHub
         working-directory: ${{ env.ROOT }}
         run: |
           npx --yes wrangler secret list --name "$WORKER" --format json \
             | jq -r --slurpfile keep "$RUNNER_TEMP/secrets.json" '.[].name | select(in($keep[0]) | not)' \
             | while read -r s; do
-                echo "Removing $s: no longer in the production environment"
+                echo "Removing $s: no WORKER_$s secret in GitHub any more"
                 npx --yes wrangler secret delete "$s" --name "$WORKER"
               done
 
@@ -135,8 +138,8 @@ jobs:
         env:
           SECRETS: ${{ toJSON(secrets) }}
         run: |
-          jq 'with_entries(select((.key | startswith("CFP_") | not) and .key != "github_token"))' <<<"$SECRETS" \
-            > "$RUNNER_TEMP/secrets.json"
+          jq 'with_entries(select(.key | startswith("WORKER_")) | .key |= ltrimstr("WORKER_") | select(.key != ""))' \
+            <<<"$SECRETS" > "$RUNNER_TEMP/secrets.json"
           echo "Shipping $(jq length "$RUNNER_TEMP/secrets.json") secret(s): $(jq -r 'keys | join(", ")' "$RUNNER_TEMP/secrets.json")"
 
       - name: Upload preview version
