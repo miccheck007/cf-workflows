@@ -1,6 +1,6 @@
 # Deploys this repo's Worker: main -> production, pull requests -> previews.
 # Copy as is to .github/workflows/cloudflare.yml; everything else lives in miccheck007/cf-workflows
-# and the Worker's manifest in miccheck007/cf-platform.
+# and the Worker's manifest in miccheck007/cf-platform. This repo holds no Cloudflare credential.
 name: cloudflare
 on:
   push:
@@ -11,10 +11,11 @@ on:
 
 permissions:
   contents: read
+  id-token: write # only the shared workflow's deploy jobs use it, to ask the platform's broker for a token
 
 jobs:
   worker:
-    uses: miccheck007/cf-workflows/.github/workflows/worker.yml@v1
+    uses: miccheck007/cf-workflows/.github/workflows/worker.yml@v2
     # Without it, environment secrets arrive empty in the shared workflow (GitHub behaviour).
     # Only secrets named WORKER_* reach the Worker; the rest is never shipped.
     secrets: inherit

@@ -1,14 +1,12 @@
-# Shared deploy + preview workflow for every Worker repo; each repo only has the caller
-# (caller/cloudflare.yml). It runs as the calling repo: its variables, its environments, its
-# GITHUB_TOKEN. This repo holds no secrets. cf-platform (reconcile.py) sets up what it reads:
-#   variables   CFP_WORKER, CLOUDFLARE_ACCOUNT_ID, CFP_ROOT_DIR, CFP_PREVIEW_WORKER (previews only)
-#   production  environment, main only: CFP_DEPLOY_TOKEN (this Worker only)
-#   preview     environment, any branch: CFP_PREVIEW_TOKEN (the preview Worker only)
-# Runtime secrets are the team's: only names starting with WORKER_ ship, without the prefix
-# (WORKER_API_KEY -> API_KEY). The caller passes `secrets: inherit`, so every repo and org secret
-# reaches this workflow; the prefix is what keeps the rest out of the Worker.
-# The tokens' scope is the boundary, not this file: a PR can edit its own caller, but only runs
-# on main get the production environment.
+# Shared deploy + preview workflow for every Worker repo (v2); each repo only has the caller
+# (caller/cloudflare.yml). It runs as the calling repo, which holds no Cloudflare credential:
+#   build     runs the repo's code (install, bundle) with nothing to steal: no secrets, and no
+#             id-token permission, so it can't ask for an OIDC token either
+#   deploy    main -> production. Runs no repo code: a pinned Wrangler on build's output, with a
+#             token from the platform's broker, which checks this run's GitHub OIDC token (this
+#             workflow, the repo's manifest, main's head, merged from a reviewed PR)
+#   preview   pull requests -> a pr-<n> version on <name>-preview, same way; closed -> retired
+# Runtime secrets: GitHub secrets named WORKER_<NAME> ship as <NAME>; nothing else ever does.
 name: worker
 on:
   workflow_call:
@@ -17,34 +15,37 @@ on:
         type: string
         default: "22"
 
+env:
+  # Fixed here, never from the calling repo: anyone who could repoint it could catch the OIDC token.
+  BROKER: https://cfp-broker.internal-a20.workers.dev
+  WRANGLER: wrangler@4.151.3
+  WRANGLER_SEND_METRICS: "false"
+
 jobs:
-  deploy:
-    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+  build:
+    if: >-
+      github.event_name == 'push' || github.event_name == 'workflow_dispatch' ||
+      (github.event_name == 'pull_request' && vars.CFP_PREVIEW_WORKER != '' &&
+       github.event.pull_request.head.repo.full_name == github.repository)
     runs-on: ubuntu-latest
-    environment: production
     permissions:
       contents: read
-    concurrency:
-      group: cfp-production
-      cancel-in-progress: false
+    outputs:
+      subject: ${{ steps.package.outputs.subject }}
     env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CFP_DEPLOY_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
-      WORKER: ${{ vars.CFP_WORKER }}
       ROOT: ${{ vars.CFP_ROOT_DIR || '.' }}
+      CLOSED: ${{ github.event.action == 'closed' }}
     steps:
-      - name: Check setup
-        run: |
-          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$WORKER" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
-            echo "::error::Not set up for deploys: this repo needs a merged manifest in cf-platform"
-            exit 1
-          fi
-
       - uses: actions/checkout@v5
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
       - uses: actions/setup-node@v5
+        if: env.CLOSED != 'true'
         with:
           node-version: ${{ inputs.node-version }}
       - name: Install dependencies
+        if: env.CLOSED != 'true'
         working-directory: ${{ env.ROOT }}
         run: |
           if [ -f package-lock.json ]; then npm ci
@@ -52,118 +53,207 @@ jobs:
           elif [ -f yarn.lock ]; then npx --yes yarn install --frozen-lockfile
           elif [ -f package.json ]; then npm install
           fi
+      - name: Bundle
+        if: env.CLOSED != 'true'
+        working-directory: ${{ env.ROOT }}
+        run: npx --yes "$WRANGLER" deploy --dry-run --outdir "$RUNNER_TEMP/pkg/bundle"
+      - name: Package
+        id: package
+        working-directory: ${{ env.ROOT }}
+        run: |
+          cfg=""; for f in wrangler.jsonc wrangler.json; do [ -f "$f" ] && { cfg=$f; break; }; done
+          [ -n "$cfg" ] || { echo "::error::needs wrangler.jsonc (wrangler.toml isn't supported)"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/pkg/src"
+          cp "$cfg" "$RUNNER_TEMP/pkg/config.jsonc"
+          # The source tree minus dependencies, for static assets; deploy reads nothing else from it.
+          tar --exclude=node_modules --exclude=.git -cf - . | tar -xf - -C "$RUNNER_TEMP/pkg/src"
+          echo "subject=$(git log -1 --format=%s | cut -c1-100)" >> "$GITHUB_OUTPUT"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: worker
+          path: ${{ runner.temp }}/pkg
+          include-hidden-files: true
+          retention-days: 1
 
-      # WORKER_<NAME> secrets -> Worker secret <NAME>; the environment's value wins over the repo's.
-      - name: Collect runtime secrets
+  deploy:
+    needs: build
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    environment: production
+    permissions:
+      contents: read
+      id-token: write # the OIDC token for the broker; no repo code runs in this job
+    concurrency:
+      group: cfp-production
+      cancel-in-progress: false
+    env:
+      KIND: production
+      MESSAGE: ${{ needs.build.outputs.subject }}
+    steps:
+      - &download
+        uses: actions/download-artifact@v8
+        with:
+          name: worker
+          path: ${{ runner.temp }}/pkg
+      - &node
+        uses: actions/setup-node@v5
+        with:
+          node-version: "22"
+      - &prepare
+        name: Prepare the deploy directory
+        env:
+          MODE: ${{ github.event.action == 'closed' && 'retire' || 'deploy' }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/tools" && npm install --prefix "$RUNNER_TEMP/tools" --no-audit --no-fund "$WRANGLER" >/dev/null
+          node - <<'JS'
+          // Builds $RUNNER_TEMP/deploy from build's output: a config we write, the bundle, static
+          // assets. Nothing in it can run code here: no build commands, no .env, no symlinks.
+          const fs = require("fs"), path = require("path");
+          const pkg = path.join(process.env.RUNNER_TEMP, "pkg"), out = path.join(process.env.RUNNER_TEMP, "deploy");
+          const fail = (m) => { console.log(`::error::${m}`); process.exit(1); };
+
+          function stripJsonc(text) { // comments and trailing commas, outside strings
+            let s = "", inStr = false;
+            for (let i = 0; i < text.length; i++) {
+              const c = text[i], n = text[i + 1];
+              if (inStr) { s += c; if (c === "\\") s += text[++i]; else if (c === '"') inStr = false; continue; }
+              if (c === '"') { inStr = true; s += c; continue; }
+              if (c === "/" && n === "/") { while (i < text.length && text[i] !== "\n") i++; s += "\n"; continue; }
+              if (c === "/" && n === "*") { const e = text.indexOf("*/", i + 2); if (e < 0) fail("bad comment in wrangler.jsonc"); i = e + 1; continue; }
+              if (c === ",") { let j = i + 1; while (/\s/.test(text[j] || "")) j++; if (text[j] === "}" || text[j] === "]") continue; }
+              s += c;
+            }
+            return s;
+          }
+          function walk(dir, f) {
+            for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+              const p = path.join(dir, e.name);
+              if (e.isSymbolicLink()) fail(`symlinks aren't deployed: ${path.relative(pkg, p)}`);
+              if (e.isDirectory()) walk(p, f); else f(p);
+            }
+          }
+
+          const cfg = JSON.parse(stripJsonc(fs.readFileSync(path.join(pkg, "config.jsonc"), "utf8")));
+          const entry = path.basename(cfg.main || "index.js").replace(/\.[^.]+$/, "") + ".js";
+          // Code-running, bundling and target keys: the platform decides these, not the repo.
+          for (const k of ["build", "env", "containers", "name", "account_id", "routes", "route", "main", "dev",
+                           "tsconfig", "alias", "define", "no_bundle", "find_additional_modules", "base_dir"]) delete cfg[k];
+          fs.mkdirSync(path.join(out, "bundle"), { recursive: true });
+
+          if (process.env.MODE === "retire") { // bindings stay, so later previews still inherit them
+            fs.writeFileSync(path.join(out, "bundle", "index.js"), `export default { fetch: () => new Response(` +
+              `"The preview for PR #${Number(process.env.PR)} is closed.", { status: 410 }) };\n`);
+            delete cfg.assets;
+            Object.assign(cfg, { main: "./bundle/index.js", no_bundle: true });
+          } else {
+            const bundle = path.join(pkg, "bundle");
+            if (!fs.existsSync(path.join(bundle, entry))) fail(`bundle has no ${entry}`);
+            walk(bundle, () => {});
+            fs.cpSync(bundle, path.join(out, "bundle"), { recursive: true });
+            if (cfg.assets?.directory) {
+              const src = path.resolve(pkg, "src", cfg.assets.directory);
+              if (!src.startsWith(path.join(pkg, "src") + path.sep)) fail("assets.directory must be inside the repo");
+              walk(src, () => {});
+              fs.cpSync(src, path.join(out, "assets"), { recursive: true });
+              cfg.assets.directory = "./assets";
+            }
+            Object.assign(cfg, { main: `./bundle/${entry}`, no_bundle: true, find_additional_modules: true, base_dir: "./bundle" });
+          }
+          fs.writeFileSync(path.join(out, "wrangler.json"), JSON.stringify(cfg, null, 2));
+          console.log(`deploying ${cfg.main} with bindings/settings from wrangler.jsonc: ${Object.keys(cfg).sort().join(", ")}`);
+          JS
+      - &token
+        name: Get a token from the broker
+        run: |
+          oidc=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+            "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$BROKER" | jq -r .value)
+          echo "::add-mask::$oidc"
+          resp=$(curl -sS -X POST "$BROKER/token" -H "Authorization: Bearer $oidc" -H "Content-Type: application/json" \
+            -d "{\"kind\":\"$KIND\"}" -w '\n%{http_code}')
+          code=${resp##*$'\n'}; body=${resp%$'\n'*}
+          if [ "$code" != 200 ]; then
+            echo "::error::The broker refused a $KIND token (HTTP $code): $(jq -r '.error // .' <<<"$body" 2>/dev/null || echo "$body")"
+            exit 1
+          fi
+          token=$(jq -r .token <<<"$body"); echo "::add-mask::$token"
+          jq '.secrets' <<<"$body" > "$RUNNER_TEMP/expected.json"
+          { echo "CLOUDFLARE_API_TOKEN=$token"; echo "CLOUDFLARE_ACCOUNT_ID=$(jq -r .account_id <<<"$body")"
+            echo "WORKER=$(jq -r .worker <<<"$body")"; } >> "$GITHUB_ENV"
+          echo "Got a $KIND token for $(jq -r .worker <<<"$body"), expiring $(jq -r .expires_on <<<"$body")"
+      - &secrets
+        name: Collect runtime secrets
+        if: github.event.action != 'closed'
         env:
           SECRETS: ${{ toJSON(secrets) }}
         run: |
-          # Our own token proves the environment's secrets are visible; never ship (or prune) blind.
-          jq -e 'has("CFP_DEPLOY_TOKEN")' <<<"$SECRETS" >/dev/null || { echo "::error::production secrets not visible"; exit 1; }
-          jq 'with_entries(select(.key | startswith("WORKER_")) | .key |= ltrimstr("WORKER_") | select(.key != ""))' \
+          # Every WORKER_ secret GitHub has for this run (names from the broker) must be visible here.
+          missing=$(jq -r --slurpfile want "$RUNNER_TEMP/expected.json" '$want[0] - keys | .[]' <<<"$SECRETS")
+          [ -z "$missing" ] || { echo "::error::secrets not visible to the workflow: $missing"; exit 1; }
+          jq --slurpfile want "$RUNNER_TEMP/expected.json" \
+            'with_entries(select(.key as $k | $want[0] | index($k)) | .key |= ltrimstr("WORKER_"))' \
             <<<"$SECRETS" > "$RUNNER_TEMP/secrets.json"
           echo "Shipping $(jq length "$RUNNER_TEMP/secrets.json") secret(s): $(jq -r 'keys | join(", ")' "$RUNNER_TEMP/secrets.json")"
 
       - name: Deploy
-        working-directory: ${{ env.ROOT }}
+        working-directory: ${{ runner.temp }}/deploy
         run: |
-          npx --yes wrangler deploy --name "$WORKER" --secrets-file "$RUNNER_TEMP/secrets.json" \
-            --message "$(git log -1 --format=%s | cut -c1-100)" --tag "${GITHUB_SHA::7}"
+          "$RUNNER_TEMP/tools/node_modules/.bin/wrangler" deploy --name "$WORKER" \
+            --secrets-file "$RUNNER_TEMP/secrets.json" --message "$MESSAGE" --tag "${GITHUB_SHA::7}"
 
-      # --secrets-file only adds and updates; a WORKER_ secret removed from GitHub goes here.
+      # --secrets-file only adds and updates; a WORKER_ secret deleted in GitHub goes here.
       - name: Remove secrets deleted from GitHub
-        working-directory: ${{ env.ROOT }}
+        working-directory: ${{ runner.temp }}/deploy
         run: |
-          npx --yes wrangler secret list --name "$WORKER" --format json \
+          wr="$RUNNER_TEMP/tools/node_modules/.bin/wrangler"
+          "$wr" secret list --name "$WORKER" --format json \
             | jq -r --slurpfile keep "$RUNNER_TEMP/secrets.json" '.[].name | select(in($keep[0]) | not)' \
             | while read -r s; do
                 echo "Removing $s: no WORKER_$s secret in GitHub any more"
-                npx --yes wrangler secret delete "$s" --name "$WORKER"
+                "$wr" secret delete "$s" --name "$WORKER"
               done
 
-      - name: Clean up
+      - &cleanup
+        name: Clean up
         if: always()
-        run: rm -f "$RUNNER_TEMP/secrets.json"
+        run: rm -rf "$RUNNER_TEMP/secrets.json" "$RUNNER_TEMP/expected.json" "$RUNNER_TEMP/pkg" "$RUNNER_TEMP/deploy"
 
   preview:
-    # Branches of this repo only: PRs from forks get no secrets.
-    if: >-
-      github.event_name == 'pull_request' && vars.CFP_PREVIEW_WORKER != '' &&
-      github.event.pull_request.head.repo.full_name == github.repository
+    needs: build
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     environment:
       name: preview
       url: ${{ steps.upload.outputs.url }}
     permissions:
       contents: read
+      id-token: write # the OIDC token for the broker; no repo code runs in this job
     concurrency:
       group: cfp-preview-${{ github.event.pull_request.number }}
       cancel-in-progress: true
     env:
-      CLOUDFLARE_API_TOKEN: ${{ secrets.CFP_PREVIEW_TOKEN }}
-      CLOUDFLARE_ACCOUNT_ID: ${{ vars.CLOUDFLARE_ACCOUNT_ID }}
-      WORKER: ${{ vars.CFP_PREVIEW_WORKER }}
-      ROOT: ${{ vars.CFP_ROOT_DIR || '.' }}
+      KIND: preview
       ALIAS: pr-${{ github.event.pull_request.number }}
       PR: ${{ github.event.pull_request.number }}
       TITLE: ${{ github.event.pull_request.title }}
       SHA: ${{ github.event.pull_request.head.sha }}
     steps:
-      - name: Check setup
-        run: |
-          if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_ACCOUNT_ID" ]; then
-            echo "::error::Not set up for previews: set previews: true in this Worker's cf-platform manifest"
-            exit 1
-          fi
-
-      - uses: actions/checkout@v5
-        if: github.event.action != 'closed'
-        with:
-          ref: ${{ env.SHA }}
-      - uses: actions/setup-node@v5
-        with:
-          node-version: ${{ inputs.node-version }}
-      - name: Install dependencies
-        if: github.event.action != 'closed'
-        working-directory: ${{ env.ROOT }}
-        run: |
-          if [ -f package-lock.json ]; then npm ci
-          elif [ -f pnpm-lock.yaml ]; then npx --yes pnpm install --frozen-lockfile
-          elif [ -f yarn.lock ]; then npx --yes yarn install --frozen-lockfile
-          elif [ -f package.json ]; then npm install
-          fi
-
-      - name: Collect preview secrets
-        if: github.event.action != 'closed'
-        env:
-          SECRETS: ${{ toJSON(secrets) }}
-        run: |
-          jq 'with_entries(select(.key | startswith("WORKER_")) | .key |= ltrimstr("WORKER_") | select(.key != ""))' \
-            <<<"$SECRETS" > "$RUNNER_TEMP/secrets.json"
-          echo "Shipping $(jq length "$RUNNER_TEMP/secrets.json") secret(s): $(jq -r 'keys | join(", ")' "$RUNNER_TEMP/secrets.json")"
-
+      - *download
+      - *node
+      - *prepare
+      - *token
+      - *secrets
       - name: Upload preview version
         id: upload
-        if: github.event.action != 'closed'
-        working-directory: ${{ env.ROOT }}
+        working-directory: ${{ runner.temp }}/deploy
         run: |
+          args=(); [ -f "$RUNNER_TEMP/secrets.json" ] && args=(--secrets-file "$RUNNER_TEMP/secrets.json")
+          if [ "${{ github.event.action }}" = closed ]; then msg="PR #$PR closed"
+          else msg=$(printf 'PR #%s: %s' "$PR" "$TITLE" | cut -c1-100); fi
           out="$RUNNER_TEMP/wrangler.ndjson"
-          WRANGLER_OUTPUT_FILE_PATH="$out" npx --yes wrangler versions upload \
-            --name "$WORKER" --preview-alias "$ALIAS" --secrets-file "$RUNNER_TEMP/secrets.json" \
-            --message "$(printf 'PR #%s: %s' "$PR" "$TITLE" | cut -c1-100)" --tag "${SHA::7}"
+          WRANGLER_OUTPUT_FILE_PATH="$out" "$RUNNER_TEMP/tools/node_modules/.bin/wrangler" versions upload \
+            --name "$WORKER" --preview-alias "$ALIAS" "${args[@]}" --message "$msg" --tag "${SHA::7}"
           url=$(jq -r 'select(.type == "version-upload") | .preview_alias_url // empty' "$out" | tail -1)
           echo "url=$url" >> "$GITHUB_OUTPUT"
           echo "### Preview: $url" >> "$GITHUB_STEP_SUMMARY"
-
-      # Aliases can't be deleted (Cloudflare keeps the newest 1000): point a closed PR's at a notice.
-      - name: Retire the preview (PR closed)
-        if: github.event.action == 'closed'
-        run: |
-          d="$RUNNER_TEMP/closed" && mkdir -p "$d" && cd "$d"
-          printf 'export default { fetch: () => new Response("The preview for PR #%s is closed.", { status: 410 }) };\n' "$PR" > index.js
-          npx --yes wrangler versions upload index.js --name "$WORKER" --preview-alias "$ALIAS" \
-            --compatibility-date 2026-10-01 --message "PR #$PR closed"
-
-      - name: Clean up
-        if: always()
-        run: rm -f "$RUNNER_TEMP/secrets.json"
+      - *cleanup
