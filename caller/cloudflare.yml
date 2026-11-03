@@ -1,0 +1,17 @@
+# Deploys this repo's Worker: main -> production, pull requests -> previews.
+# Copy as is to .github/workflows/cloudflare.yml; everything else lives in miccheck007/cf-workflows
+# and the Worker's manifest in miccheck007/cf-platform.
+name: cloudflare
+on:
+  push:
+    branches: [main]
+  pull_request:
+    types: [opened, synchronize, reopened, closed]
+  workflow_dispatch: # redeploy main, e.g. to ship a changed secret
+
+permissions:
+  contents: read
+
+jobs:
+  worker:
+    uses: miccheck007/cf-workflows/.github/workflows/worker.yml@v1
