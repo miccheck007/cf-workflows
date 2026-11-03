@@ -223,24 +223,37 @@ jobs:
             <<<"$SECRETS" > "$RUNNER_TEMP/secrets.json"
           echo "Shipping $(jq length "$RUNNER_TEMP/secrets.json") secret(s): $(jq -r 'keys | join(", ")' "$RUNNER_TEMP/secrets.json")"
 
+      # --secrets-file only adds and updates, and a deploy inherits secrets from the latest version.
+      # Secrets without a WORKER_ secret in the production environment are dropped from that
+      # version first, as one labelled version that is never deployed itself; the deploy then
+      # inherits only what GitHub has, in a single deployment.
+      - name: Remove secrets not in GitHub
+        run: |
+          api="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/workers/$WORKER/versions/latest"
+          latest=$(curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$api")
+          if ! jq -e .success <<<"$latest" >/dev/null; then
+            jq -e '.errors | any(.code == 10222)' <<<"$latest" >/dev/null && { echo "No versions yet"; exit 0; }
+            echo "::error::reading the latest version failed: $(jq -c .errors <<<"$latest")"; exit 1
+          fi
+          stale=$(jq -c --slurpfile keep "$RUNNER_TEMP/secrets.json" '[.result.env // {} | to_entries[]
+            | select(.value.type == "secret_text" and (.key | in($keep[0]) | not)) | .key]' <<<"$latest")
+          [ "$stale" != "[]" ] || exit 0
+          names=$(jq -r 'join(", ")' <<<"$stale")
+          echo "Removing $names: no WORKER_ secret in the production environment"
+          body=$(jq -n --argjson s "$stale" --arg m "Remove secrets not in GitHub: $names" --arg t "${GITHUB_SHA::7}" \
+            '{env: ($s | map({(.): null}) | add), annotations: {"workers/message": $m[:100], "workers/tag": $t}}')
+          res=$(curl -sS -X PATCH -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+            -H "Content-Type: application/merge-patch+json" -d "$body" "$api")
+          jq -e .success <<<"$res" >/dev/null || { echo "::error::removing secrets failed: $(jq -c .errors <<<"$res")"; exit 1; }
+
       - name: Deploy
         working-directory: ${{ runner.temp }}/deploy
         run: |
+          message="$MESSAGE"
+          [ "$GITHUB_EVENT_NAME" != workflow_dispatch ] || message="Redeploy: $message"
+          [ "$GITHUB_RUN_ATTEMPT" = 1 ] || message="$message (attempt $GITHUB_RUN_ATTEMPT)"
           "$RUNNER_TEMP/tools/node_modules/.bin/wrangler" deploy --name "$WORKER" \
-            --secrets-file "$RUNNER_TEMP/secrets.json" --message "$MESSAGE" --tag "${GITHUB_SHA::7}"
-
-      # --secrets-file only adds and updates (a deploy inherits secrets from the latest version):
-      # anything not a WORKER_ secret of the production environment goes here.
-      - name: Remove secrets not in GitHub
-        working-directory: ${{ runner.temp }}/deploy
-        run: |
-          wr="$RUNNER_TEMP/tools/node_modules/.bin/wrangler"
-          "$wr" secret list --name "$WORKER" --format json \
-            | jq -r --slurpfile keep "$RUNNER_TEMP/secrets.json" '.[].name | select(in($keep[0]) | not)' \
-            | while read -r s; do
-                echo "Removing $s: no WORKER_$s secret in the production environment"
-                "$wr" secret delete "$s" --name "$WORKER"
-              done
+            --secrets-file "$RUNNER_TEMP/secrets.json" --message "${message:0:100}" --tag "${GITHUB_SHA::7}"
 
       - &revoke
         name: Revoke the token
