@@ -13,7 +13,9 @@ to `.github/workflows/cloudflare.yml`. Onboarding, manifests and tokens are in
 
 **Secrets**: every secret in the Worker repo's `production` environment becomes a Worker secret of
 the same name on the next deploy; deleting one there deletes it from the Worker. `preview` works the
-same for previews. Names starting with `CFP_` are the platform's and never shipped.
+same for previews. Names starting with `CFP_` are the platform's and never shipped. Keep Worker
+repos free of repository-level secrets: the caller has to pass `secrets: inherit` (environment
+secrets arrive empty otherwise), so those would be shipped to production and previews alike.
 
 This repo holds no secrets and no state. It is still security-critical: whatever `worker.yml` runs,
 runs with every Worker's deploy token. Changes go through review; callers pin `@v1`, which only
