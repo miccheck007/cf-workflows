@@ -16,7 +16,9 @@ broker only answers this workflow (`@v2`), for a repo with a manifest, and for p
 | pull request opened / updated | `build` → `preview` (environment `preview`) | the Worker's [Preview](https://developers.cloudflare.com/workers/previews/) `pr-<n>` (`wrangler preview`), listed under the Worker in the dashboard; URL on the PR's deployment |
 | pull request closed | `build` → `preview-delete` (no environment) | the Preview is deleted and the PR's preview deployments are marked inactive |
 
-After a push to `main`, the merged PR gets a comment: *Deployed to production* with the version, or
+Each PR keeps one comment with its Preview's URL (latest push) and the fixed URL of the commit it
+was built from, edited on every push; on close it says the Preview was deleted. After a push to
+`main`, the merged PR gets a comment: *Deployed to production* with the version, or
 *Not deployed to production* with the reason (e.g. the broker's refusal). The PR page itself only
 shows the PR branch's deployments, which are previews. The caller grants `pull-requests: write`
 and `deployments: write` for this; the job that runs the repo's code keeps only `contents: read`.
