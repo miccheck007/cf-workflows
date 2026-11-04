@@ -301,6 +301,7 @@ jobs:
     permissions:
       contents: read
       id-token: write # the OIDC token for the broker; no repo code runs in this job
+      pull-requests: write # the PR's preview comment
     concurrency:
       group: cfp-preview-${{ github.event.pull_request.number }}
       cancel-in-progress: true
@@ -330,8 +331,28 @@ jobs:
             --name "$PREVIEW" --worker-name "$WORKER" --ignore-base-config \
             --secrets-file "$RUNNER_TEMP/secrets.json" --message "${message:0:100}" --tag "${SHA::7}"
           url=$(jq -rs 'map(select(.type == "preview")) | last | .preview_urls[0] // empty' "$RUNNER_TEMP/out.json")
+          commit_url=$(jq -rs 'map(select(.type == "preview")) | last | .deployment_urls[0] // empty' "$RUNNER_TEMP/out.json")
           echo "url=$url" >> "$GITHUB_OUTPUT"
           echo "### Preview $PREVIEW: ${url:-no URL}" >> "$GITHUB_STEP_SUMMARY"
+          printf '**Preview** `%s` of `%s`, built from `%s`\n\n| | |\n|---|---|\n| Latest push | %s |\n| This commit | %s |\n' \
+            "$PREVIEW" "$WORKER" "${SHA::7}" "${url:-none}" "${commit_url:-none}" > "$RUNNER_TEMP/comment.md"
+      - &comment
+        # One comment per PR, found by its marker and edited on every push and on close.
+        name: Update the PR's preview comment
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          [ -f "$RUNNER_TEMP/comment.md" ] || exit 0 # nothing to say: an earlier step failed
+          body="<!-- cfp-preview -->"$'\n'"$(cat "$RUNNER_TEMP/comment.md")"
+          id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments?per_page=100" --jq '[.[] | select(.user.login == "github-actions[bot]"
+            and (.body | startswith("<!-- cfp-preview -->")))][0].id // empty')
+          if [ -n "$id" ]; then
+            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -f body="$body" >/dev/null
+          else
+            gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -f body="$body" >/dev/null
+          fi
+          rm -f "$RUNNER_TEMP/comment.md"
       - *revoke
       - *cleanup
 
@@ -345,6 +366,7 @@ jobs:
       contents: read
       id-token: write # the OIDC token for the broker; no repo code runs in this job
       deployments: write # marking the PR's preview deployments inactive
+      pull-requests: write # the PR's preview comment
     concurrency:
       group: cfp-preview-${{ github.event.pull_request.number }}
       cancel-in-progress: true
@@ -352,6 +374,7 @@ jobs:
       KIND: preview
       MODE: delete
       PREVIEW: pr-${{ github.event.pull_request.number }}
+      PR: ${{ github.event.pull_request.number }}
     steps:
       - *node
       - *token
@@ -376,5 +399,7 @@ jobs:
               gh api -X POST "repos/$GITHUB_REPOSITORY/deployments/$id/statuses" \
                 -f state=inactive -f description="Preview deleted: PR closed" >/dev/null
             done
+          printf '**Preview** `%s` deleted: the PR was closed.\n' "$PREVIEW" > "$RUNNER_TEMP/comment.md"
+      - *comment
       - *revoke
       - *cleanup
