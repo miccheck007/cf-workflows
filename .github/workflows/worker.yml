@@ -277,7 +277,7 @@ jobs:
           if [ "$OUTCOME" = success ]; then
             body="**Deployed to production**: \`${WORKER}\` version \`${VERSION:-?}\` (\`${GITHUB_SHA::7}\`). [Run]($RUN)"
           else
-            body="**Not deployed to production.** ${REFUSED:-The deploy job failed before deploying.} Production still runs the previous version. [Run]($RUN)"
+            body="**Not deployed to production.** ${REFUSED:-The deploy job failed before deploying}. Production still runs the previous version. [Run]($RUN)"
           fi
           gh pr comment "$pr" --repo "$GITHUB_REPOSITORY" --body "$body"
 
