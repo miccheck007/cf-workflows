@@ -14,7 +14,14 @@ broker only answers this workflow (`@v2`), for a repo with a manifest, and for p
 |---|---|---|
 | push to `main`, or *Run workflow* | `build` → `deploy` (environment `production`) | `wrangler deploy` with the commit as message/tag, plus the `WORKER_` secrets |
 | pull request opened / updated | `build` → `preview` (environment `preview`) | the Worker's [Preview](https://developers.cloudflare.com/workers/previews/) `pr-<n>` (`wrangler preview`), listed under the Worker in the dashboard; URL on the PR's deployment |
-| pull request closed | `build` → `preview` | the Preview is deleted |
+| pull request closed | `build` → `preview-delete` (no environment) | the Preview is deleted and the PR's preview deployments are marked inactive |
+
+After a push to `main`, the merged PR gets a comment: *Deployed to production* with the version, or
+*Not deployed to production* with the reason (e.g. the broker's refusal). The PR page itself only
+shows the PR branch's deployments, which are previews. The caller grants `pull-requests: write`
+and `deployments: write` for this; the job that runs the repo's code keeps only `contents: read`.
+A shared workflow can't use more than its caller grants, so a caller missing these makes every run
+fail to start: update callers before moving `v2` to a version that needs more.
 
 `build` runs the repo's code (install, `wrangler deploy --dry-run`) and holds nothing: no secrets,
 no permission to request an OIDC token. `deploy`/`preview` run no repo code: a pinned Wrangler on

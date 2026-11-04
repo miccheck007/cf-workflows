@@ -6,7 +6,8 @@
 #             token from the platform's broker, which checks this run's GitHub OIDC token (this
 #             workflow, the repo's manifest, main's head, merged from a reviewed PR)
 #   preview   pull requests -> the Worker's Preview pr-<n> (`wrangler preview`), same way;
-#             closed -> the Preview is deleted
+#             preview-delete: closed -> the Preview is deleted, its PR deployments marked inactive
+# The merged PR gets a comment saying whether production was deployed (and why not).
 # KV IDs come from the broker (production's, or the _PREVIEW copies) and are written into every
 # upload. A Preview takes its bindings only from the `previews` block, which is written here, and
 # inherits nothing from production. Runtime secrets: GitHub secrets named WORKER_<NAME> ship as
@@ -88,6 +89,7 @@ jobs:
     permissions:
       contents: read
       id-token: write # the OIDC token for the broker; no repo code runs in this job
+      pull-requests: write # the comment on the merged PR
     concurrency:
       group: cfp-production
       cancel-in-progress: false
@@ -115,7 +117,9 @@ jobs:
             -d "{\"kind\":\"$KIND\"}" -w '\n%{http_code}')
           code=${resp##*$'\n'}; body=${resp%$'\n'*}
           if [ "$code" != 200 ]; then
-            echo "::error::The broker refused a $KIND token (HTTP $code): $(jq -r '.error // .' <<<"$body" 2>/dev/null || echo "$body")"
+            reason="The broker refused a $KIND token (HTTP $code): $(jq -r '.error // .' <<<"$body" 2>/dev/null || echo "$body")"
+            echo "::error::$reason"
+            echo "REFUSED=$(tr -d '\r\n' <<<"$reason")" >> "$GITHUB_ENV" # for the PR comment
             exit 1
           fi
           token=$(jq -r .token <<<"$body"); echo "::add-mask::$token"
@@ -247,13 +251,35 @@ jobs:
           jq -e .success <<<"$res" >/dev/null || { echo "::error::removing secrets failed: $(jq -c .errors <<<"$res")"; exit 1; }
 
       - name: Deploy
+        id: deploy
         working-directory: ${{ runner.temp }}/deploy
         run: |
           message="$MESSAGE"
           [ "$GITHUB_EVENT_NAME" != workflow_dispatch ] || message="Redeploy: $message"
           [ "$GITHUB_RUN_ATTEMPT" = 1 ] || message="$message (attempt $GITHUB_RUN_ATTEMPT)"
-          "$RUNNER_TEMP/tools/node_modules/.bin/wrangler" deploy --name "$WORKER" \
+          WRANGLER_OUTPUT_FILE_PATH="$RUNNER_TEMP/out.json" "$RUNNER_TEMP/tools/node_modules/.bin/wrangler" deploy --name "$WORKER" \
             --secrets-file "$RUNNER_TEMP/secrets.json" --message "${message:0:100}" --tag "${GITHUB_SHA::7}"
+          echo "version=$(jq -rs 'map(select(.type == "deploy")) | last | .version_id // empty' "$RUNNER_TEMP/out.json")" >> "$GITHUB_OUTPUT"
+
+      # The PR page only shows deployments of the PR's branch; production's is on main's merge
+      # commit. So the merged PR is told what happened to it, deployed or not.
+      - name: Report on the merged PR
+        if: always() && github.event_name == 'push'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.deploy.outputs.version }}
+          OUTCOME: ${{ steps.deploy.outcome }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          pr=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
+            --jq '[.[] | select(.merged_at and .merge_commit_sha == env.GITHUB_SHA)][0].number // empty')
+          [ -n "$pr" ] || { echo "No merged PR for ${GITHUB_SHA::7}"; exit 0; }
+          if [ "$OUTCOME" = success ]; then
+            body="**Deployed to production**: \`${WORKER}\` version \`${VERSION:-?}\` (\`${GITHUB_SHA::7}\`). [Run]($RUN)"
+          else
+            body="**Not deployed to production.** ${REFUSED:-The deploy job failed before deploying.} Production still runs the previous version. [Run]($RUN)"
+          fi
+          gh pr comment "$pr" --repo "$GITHUB_REPOSITORY" --body "$body"
 
       - &revoke
         name: Revoke the token
@@ -267,7 +293,7 @@ jobs:
 
   preview:
     needs: build
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' && github.event.action != 'closed'
     runs-on: ubuntu-latest
     environment:
       name: preview
@@ -280,7 +306,7 @@ jobs:
       cancel-in-progress: true
     env:
       KIND: preview
-      MODE: ${{ github.event.action == 'closed' && 'delete' || 'preview' }}
+      MODE: preview
       PREVIEW: pr-${{ github.event.pull_request.number }}
       PR: ${{ github.event.pull_request.number }}
       TITLE: ${{ github.event.pull_request.title }}
@@ -296,7 +322,6 @@ jobs:
       # settings edited in the dashboard.
       - name: Deploy the Preview
         id: preview
-        if: env.MODE == 'preview'
         working-directory: ${{ runner.temp }}/deploy
         run: |
           message="PR #$PR: $TITLE"
@@ -307,8 +332,31 @@ jobs:
           url=$(jq -rs 'map(select(.type == "preview")) | last | .preview_urls[0] // empty' "$RUNNER_TEMP/out.json")
           echo "url=$url" >> "$GITHUB_OUTPUT"
           echo "### Preview $PREVIEW: ${url:-no URL}" >> "$GITHUB_STEP_SUMMARY"
+      - *revoke
+      - *cleanup
+
+  # PR closed (merged or not). No environment: deleting the Preview isn't a deployment, and in the
+  # `preview` environment GitHub would show it on the PR as "This branch was successfully deployed".
+  preview-delete:
+    needs: build
+    if: github.event_name == 'pull_request' && github.event.action == 'closed'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # the OIDC token for the broker; no repo code runs in this job
+      deployments: write # marking the PR's preview deployments inactive
+    concurrency:
+      group: cfp-preview-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+    env:
+      KIND: preview
+      MODE: delete
+      PREVIEW: pr-${{ github.event.pull_request.number }}
+    steps:
+      - *node
+      - *token
+      - *prepare
       - name: Delete the Preview
-        if: env.MODE == 'delete'
         working-directory: ${{ runner.temp }}/deploy
         run: |
           "$RUNNER_TEMP/tools/node_modules/.bin/wrangler" preview delete \
@@ -318,5 +366,15 @@ jobs:
             "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/workers/$WORKER/previews/$PREVIEW")
           [ "$code" = 404 ] || exit 1
           echo "No Preview $PREVIEW to delete"
+      - name: Mark the PR's preview deployments inactive
+        env:
+          GH_TOKEN: ${{ github.token }}
+          BRANCH: ${{ github.event.pull_request.head.ref }}
+        run: |
+          gh api "repos/$GITHUB_REPOSITORY/deployments?environment=preview&ref=$BRANCH&per_page=100" --jq '.[].id' |
+            while read -r id; do
+              gh api -X POST "repos/$GITHUB_REPOSITORY/deployments/$id/statuses" \
+                -f state=inactive -f description="Preview deleted: PR closed" >/dev/null
+            done
       - *revoke
       - *cleanup
