@@ -1,5 +1,5 @@
-# Shared deploy + preview workflow for every Worker repo (v2); each repo only has the caller
-# (caller/cloudflare.yml). It runs as the calling repo, which holds no Cloudflare credential:
+# Shared deploy + preview workflow for every Worker repo; each repo only has the caller
+# (caller/cloudflare.yml, `@main`). It runs as the calling repo, which holds no Cloudflare credential:
 #   build     runs the repo's code (install, bundle) with nothing to steal: no secrets, and no
 #             id-token permission, so it can't ask for an OIDC token either
 #   deploy    main -> production. Runs no repo code: a pinned Wrangler on build's output, with a
@@ -7,7 +7,10 @@
 #             workflow, the repo's manifest, main's head, merged from a reviewed PR)
 #   preview   pull requests -> the Worker's Preview pr-<n> (`wrangler preview`), same way;
 #             preview-delete: closed -> the Preview is deleted, its PR deployments marked inactive
-# The merged PR gets a comment saying whether production was deployed (and why not).
+#   report    the only job that comments on the PR: the Preview's links, whether production was
+#             deployed, or which step failed and what to do. It holds no token and runs no repo code.
+# A failure is reported where it happened; nothing retries it later. Only the broker call
+# retries itself, on transient errors.
 # KV IDs come from the broker (production's, or the _PREVIEW copies) and are written into every
 # upload. A Preview takes its bindings only from the `previews` block, which is written here, and
 # inherits nothing from production. Runtime secrets: GitHub secrets named WORKER_<NAME> ship as
@@ -38,6 +41,7 @@ jobs:
       contents: read
     outputs:
       subject: ${{ steps.package.outputs.subject }}
+      failed: ${{ steps.failed.outputs.step }}
     env:
       ROOT: ${{ vars.CFP_ROOT_DIR || '.' }}
       CLOSED: ${{ github.event.action == 'closed' }}
@@ -51,6 +55,7 @@ jobs:
         with:
           node-version: ${{ inputs.node-version }}
       - name: Install dependencies
+        id: install
         if: env.CLOSED != 'true'
         working-directory: ${{ env.ROOT }}
         run: |
@@ -60,6 +65,7 @@ jobs:
           elif [ -f package.json ]; then npm install
           fi
       - name: Bundle
+        id: bundle
         if: env.CLOSED != 'true'
         working-directory: ${{ env.ROOT }}
         run: npx --yes "$WRANGLER" deploy --dry-run --outdir "$RUNNER_TEMP/pkg/bundle"
@@ -80,6 +86,13 @@ jobs:
           path: ${{ runner.temp }}/pkg
           include-hidden-files: true
           retention-days: 1
+      - &failed
+        # The first step (with an id) that failed, for the report job.
+        id: failed
+        if: failure()
+        env:
+          STEPS: ${{ toJSON(steps) }}
+        run: echo "step=$(jq -r 'to_entries | map(select(.value.outcome == "failure")) | first | .key // "unknown"' <<<"$STEPS")" >> "$GITHUB_OUTPUT"
 
   deploy:
     needs: build
@@ -89,7 +102,11 @@ jobs:
     permissions:
       contents: read
       id-token: write # the OIDC token for the broker; no repo code runs in this job
-      pull-requests: write # the comment on the merged PR
+    outputs:
+      version: ${{ steps.deploy.outputs.version }}
+      worker: ${{ steps.token.outputs.worker }}
+      refused: ${{ steps.token.outputs.refused }}
+      failed: ${{ steps.failed.outputs.step }}
     concurrency:
       group: cfp-production
       cancel-in-progress: false
@@ -99,27 +116,34 @@ jobs:
       MESSAGE: ${{ needs.build.outputs.subject }}
     steps:
       - &download
+        id: download
         uses: actions/download-artifact@v8
         with:
           name: worker
           path: ${{ runner.temp }}/pkg
       - &node
+        id: node
         uses: actions/setup-node@v5
         with:
           node-version: "22"
       - &token
         name: Get a token from the broker
+        id: token
         run: |
-          oidc=$(curl -sSf -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
+          # Transient errors (timeouts, 5xx, refused connections) are retried twice, seconds apart;
+          # a refusal (4xx) never is.
+          retry=(--retry 2 --retry-delay 5 --retry-connrefused)
+          oidc=$(curl -sSf "${retry[@]}" -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
             "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=$BROKER" | jq -r .value)
           echo "::add-mask::$oidc"
-          resp=$(curl -sS -X POST "$BROKER/token" -H "Authorization: Bearer $oidc" -H "Content-Type: application/json" \
-            -d "{\"kind\":\"$KIND\"}" -w '\n%{http_code}')
+          resp=$(curl -sS "${retry[@]}" -X POST "$BROKER/token" -H "Authorization: Bearer $oidc" \
+            -H "Content-Type: application/json" -d "{\"kind\":\"$KIND\"}" -w '\n%{http_code}') || resp=$'\n000'
           code=${resp##*$'\n'}; body=${resp%$'\n'*}
           if [ "$code" != 200 ]; then
             reason="The broker refused a $KIND token (HTTP $code): $(jq -r '.error // .' <<<"$body" 2>/dev/null || echo "$body")"
+            [ "$code" = 000 ] && reason="The broker didn't answer"
             echo "::error::$reason"
-            echo "REFUSED=$(tr -d '\r\n' <<<"$reason")" >> "$GITHUB_ENV" # for the PR comment
+            echo "refused=$(tr -d '\r\n' <<<"$reason")" >> "$GITHUB_OUTPUT" # for the report job
             exit 1
           fi
           token=$(jq -r .token <<<"$body"); echo "::add-mask::$token"
@@ -127,9 +151,11 @@ jobs:
           jq 'del(.token)' <<<"$body" > "$RUNNER_TEMP/broker.json"
           { echo "CLOUDFLARE_API_TOKEN=$token"; echo "CLOUDFLARE_ACCOUNT_ID=$(jq -r .account_id <<<"$body")"
             echo "WORKER=$(jq -r .worker <<<"$body")"; } >> "$GITHUB_ENV"
+          echo "worker=$(jq -r .worker <<<"$body")" >> "$GITHUB_OUTPUT"
           echo "Got a $KIND token for $(jq -r .worker <<<"$body"), expiring $(jq -r .expires_on <<<"$body")"
       - &prepare
         name: Prepare the upload
+        id: prepare
         env:
           PR: ${{ github.event.pull_request.number }}
         run: |
@@ -214,6 +240,7 @@ jobs:
           JS
       - &secrets
         name: Collect runtime secrets
+        id: secrets
         if: github.event.action != 'closed'
         env:
           SECRETS: ${{ toJSON(secrets) }}
@@ -232,6 +259,7 @@ jobs:
       # version first, as one labelled version that is never deployed itself; the deploy then
       # inherits only what GitHub has, in a single deployment.
       - name: Remove secrets not in GitHub
+        id: prune
         run: |
           api="https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/workers/workers/$WORKER/versions/latest"
           latest=$(curl -sS -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" "$api")
@@ -261,26 +289,7 @@ jobs:
             --secrets-file "$RUNNER_TEMP/secrets.json" --message "${message:0:100}" --tag "${GITHUB_SHA::7}"
           echo "version=$(jq -rs 'map(select(.type == "deploy")) | last | .version_id // empty' "$RUNNER_TEMP/out.json")" >> "$GITHUB_OUTPUT"
 
-      # The PR page only shows deployments of the PR's branch; production's is on main's merge
-      # commit. So the merged PR is told what happened to it, deployed or not.
-      - name: Report on the merged PR
-        if: always() && github.event_name == 'push'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.deploy.outputs.version }}
-          OUTCOME: ${{ steps.deploy.outcome }}
-          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
-        run: |
-          pr=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
-            --jq '[.[] | select(.merged_at and .merge_commit_sha == env.GITHUB_SHA)][0].number // empty')
-          [ -n "$pr" ] || { echo "No merged PR for ${GITHUB_SHA::7}"; exit 0; }
-          if [ "$OUTCOME" = success ]; then
-            body="**Deployed to production**: \`${WORKER}\` version \`${VERSION:-?}\` (\`${GITHUB_SHA::7}\`). [Run]($RUN)"
-          else
-            body="**Not deployed to production.** ${REFUSED:-The deploy job failed before deploying}. Production still runs the previous version. [Run]($RUN)"
-          fi
-          gh pr comment "$pr" --repo "$GITHUB_REPOSITORY" --body "$body"
-
+      - *failed
       - &revoke
         name: Revoke the token
         if: always() && env.CLOUDFLARE_API_TOKEN != ''
@@ -301,7 +310,12 @@ jobs:
     permissions:
       contents: read
       id-token: write # the OIDC token for the broker; no repo code runs in this job
-      pull-requests: write # the PR's preview comment
+    outputs:
+      url: ${{ steps.preview.outputs.url }}
+      commit_url: ${{ steps.preview.outputs.commit_url }}
+      worker: ${{ steps.token.outputs.worker }}
+      refused: ${{ steps.token.outputs.refused }}
+      failed: ${{ steps.failed.outputs.step }}
     concurrency:
       group: cfp-preview-${{ github.event.pull_request.number }}
       cancel-in-progress: true
@@ -332,27 +346,9 @@ jobs:
             --secrets-file "$RUNNER_TEMP/secrets.json" --message "${message:0:100}" --tag "${SHA::7}"
           url=$(jq -rs 'map(select(.type == "preview")) | last | .preview_urls[0] // empty' "$RUNNER_TEMP/out.json")
           commit_url=$(jq -rs 'map(select(.type == "preview")) | last | .deployment_urls[0] // empty' "$RUNNER_TEMP/out.json")
-          echo "url=$url" >> "$GITHUB_OUTPUT"
+          { echo "url=$url"; echo "commit_url=$commit_url"; } >> "$GITHUB_OUTPUT"
           echo "### Preview $PREVIEW: ${url:-no URL}" >> "$GITHUB_STEP_SUMMARY"
-          printf '**Preview** `%s` of `%s`, built from `%s`\n\n| | |\n|---|---|\n| Latest push | %s |\n| This commit | %s |\n' \
-            "$PREVIEW" "$WORKER" "${SHA::7}" "${url:-none}" "${commit_url:-none}" > "$RUNNER_TEMP/comment.md"
-      - &comment
-        # One comment per PR, found by its marker and edited on every push and on close.
-        name: Update the PR's preview comment
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          [ -f "$RUNNER_TEMP/comment.md" ] || exit 0 # nothing to say: an earlier step failed
-          body="<!-- cfp-preview -->"$'\n'"$(cat "$RUNNER_TEMP/comment.md")"
-          id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments?per_page=100" --jq '[.[] | select(.user.login == "github-actions[bot]"
-            and (.body | startswith("<!-- cfp-preview -->")))][0].id // empty')
-          if [ -n "$id" ]; then
-            gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -f body="$body" >/dev/null
-          else
-            gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -f body="$body" >/dev/null
-          fi
-          rm -f "$RUNNER_TEMP/comment.md"
+      - *failed
       - *revoke
       - *cleanup
 
@@ -366,7 +362,9 @@ jobs:
       contents: read
       id-token: write # the OIDC token for the broker; no repo code runs in this job
       deployments: write # marking the PR's preview deployments inactive
-      pull-requests: write # the PR's preview comment
+    outputs:
+      refused: ${{ steps.token.outputs.refused }}
+      failed: ${{ steps.failed.outputs.step }}
     concurrency:
       group: cfp-preview-${{ github.event.pull_request.number }}
       cancel-in-progress: true
@@ -380,6 +378,7 @@ jobs:
       - *token
       - *prepare
       - name: Delete the Preview
+        id: delete
         working-directory: ${{ runner.temp }}/deploy
         run: |
           "$RUNNER_TEMP/tools/node_modules/.bin/wrangler" preview delete \
@@ -390,6 +389,7 @@ jobs:
           [ "$code" = 404 ] || exit 1
           echo "No Preview $PREVIEW to delete"
       - name: Mark the PR's preview deployments inactive
+        id: inactive
         env:
           GH_TOKEN: ${{ github.token }}
           BRANCH: ${{ github.event.pull_request.head.ref }}
@@ -399,7 +399,98 @@ jobs:
               gh api -X POST "repos/$GITHUB_REPOSITORY/deployments/$id/statuses" \
                 -f state=inactive -f description="Preview deleted: PR closed" >/dev/null
             done
-          printf '**Preview** `%s` deleted: the PR was closed.\n' "$PREVIEW" > "$RUNNER_TEMP/comment.md"
-      - *comment
+      - *failed
       - *revoke
       - *cleanup
+
+  # Tells the PR what happened, success or failure, with the reason and what to do. The PR page only
+  # shows deployments of the PR's branch (previews); production's result would be invisible there.
+  report:
+    needs: [build, deploy, preview, preview-delete]
+    if: always() && needs.build.result != 'skipped' && github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write # the PR comments; no token, no repo code in this job
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+      ACTION: ${{ github.event.action }}
+      PREVIEW: pr-${{ github.event.pull_request.number }}
+      PR: ${{ github.event.pull_request.number }}
+      SHA: ${{ github.event.pull_request.head.sha || github.sha }}
+      BUILD: ${{ needs.build.result }}
+      BUILD_FAILED: ${{ needs.build.outputs.failed }}
+      DEPLOY: ${{ needs.deploy.result }}
+      DEPLOY_FAILED: ${{ needs.deploy.outputs.failed }}
+      DEPLOY_REFUSED: ${{ needs.deploy.outputs.refused }}
+      VERSION: ${{ needs.deploy.outputs.version }}
+      PREVIEW_RESULT: ${{ needs.preview.result }}
+      PREVIEW_FAILED: ${{ needs.preview.outputs.failed }}
+      PREVIEW_REFUSED: ${{ needs.preview.outputs.refused }}
+      URL: ${{ needs.preview.outputs.url }}
+      COMMIT_URL: ${{ needs.preview.outputs.commit_url }}
+      DELETE: ${{ needs.preview-delete.result }}
+      DELETE_FAILED: ${{ needs.preview-delete.outputs.failed }}
+      DELETE_REFUSED: ${{ needs.preview-delete.outputs.refused }}
+      WORKER: ${{ needs.deploy.outputs.worker || needs.preview.outputs.worker }}
+    steps:
+      - name: Comment on the PR
+        run: |
+          where() { # which step failed, in words
+            case "$1" in
+              install) echo "the build, installing dependencies" ;;
+              bundle) echo "the build, bundling (\`wrangler deploy --dry-run\`)" ;;
+              package) echo "the build, packaging (is there a \`wrangler.jsonc\`?)" ;;
+              download|node) echo "setting up the job" ;;
+              token) echo "getting a token from the broker" ;;
+              prepare) echo "preparing the upload from \`wrangler.jsonc\`" ;;
+              secrets) echo "collecting the \`WORKER_\` secrets" ;;
+              prune) echo "removing secrets that aren't in GitHub" ;;
+              deploy) echo "the deploy (\`wrangler deploy\`)" ;;
+              preview) echo "the Preview deploy (\`wrangler preview\`)" ;;
+              delete) echo "deleting the Preview" ;;
+              inactive) echo "marking the preview deployments inactive" ;;
+              *) echo "an unnamed step" ;;
+            esac
+          }
+          # A failed build stops everything after it, so it comes first.
+          failure() { # job result, its failed step, the broker's refusal
+            if [ "$BUILD" = failure ]; then echo "Failed at $(where "$BUILD_FAILED")."
+            elif [ "$1" = cancelled ]; then echo "The run was cancelled."
+            elif [ -n "$3" ]; then echo "$3."
+            else echo "Failed at $(where "$2")."; fi
+          }
+          upsert() { # the PR's one preview comment, found by its marker
+            body="<!-- cfp-preview -->"$'\n'"$1"
+            id=$(gh api "repos/$GITHUB_REPOSITORY/issues/$PR/comments?per_page=100" --jq '[.[] | select(.user.login == "github-actions[bot]"
+              and (.body | startswith("<!-- cfp-preview -->")))][0].id // empty')
+            if [ -n "$id" ]; then
+              gh api -X PATCH "repos/$GITHUB_REPOSITORY/issues/comments/$id" -f body="$body" >/dev/null
+            else
+              gh api -X POST "repos/$GITHUB_REPOSITORY/issues/$PR/comments" -f body="$body" >/dev/null
+            fi
+          }
+
+          if [ "$GITHUB_EVENT_NAME" = push ]; then
+            pr=$(gh api "repos/$GITHUB_REPOSITORY/commits/$GITHUB_SHA/pulls" \
+              --jq '[.[] | select(.merged_at and .merge_commit_sha == env.GITHUB_SHA)][0].number // empty')
+            [ -n "$pr" ] || { echo "No merged PR for ${GITHUB_SHA::7}"; exit 0; }
+            if [ "$DEPLOY" = success ]; then
+              body="**Deployed to production**: \`$WORKER\` version \`${VERSION:-?}\` (\`${GITHUB_SHA::7}\`). [Run]($RUN)"
+            elif [ -n "$DEPLOY_REFUSED" ] && [ "$BUILD" != failure ]; then
+              body="**Not deployed to production.** $DEPLOY_REFUSED. Production still runs the previous version. Fix the cause, then merge a PR (an empty commit is fine). [Run]($RUN)"
+            else
+              body="**Not deployed to production.** $(failure "$DEPLOY" "$DEPLOY_FAILED" "") Production still runs the previous version. Once the cause is fixed, *Re-run failed jobs* on the [run]($RUN) (works while \`main\` hasn't moved), or merge a fix."
+            fi
+            gh pr comment "$pr" --repo "$GITHUB_REPOSITORY" --body "$body"
+          elif [ "$ACTION" = closed ]; then
+            if [ "$DELETE" = success ]; then upsert "**Preview** \`$PREVIEW\` deleted: the PR was closed."
+            else upsert "**Preview** \`$PREVIEW\` could not be deleted. $(failure "$DELETE" "$DELETE_FAILED" "$DELETE_REFUSED") *Re-run failed jobs* on the [run]($RUN)."; fi
+          else
+            if [ "$PREVIEW_RESULT" = success ]; then
+              upsert "$(printf '**Preview** `%s` of `%s`, built from `%s`\n\n| | |\n|---|---|\n| Latest push | %s |\n| This commit | %s |\n' \
+                "$PREVIEW" "$WORKER" "${SHA::7}" "${URL:-none}" "${COMMIT_URL:-none}")"
+            else
+              upsert "**Preview** \`$PREVIEW\` not updated for \`${SHA::7}\`. $(failure "$PREVIEW_RESULT" "$PREVIEW_FAILED" "$PREVIEW_REFUSED") It still runs an earlier push, if any. Push a fix, or *Re-run failed jobs* on the [run]($RUN)."
+            fi
+          fi
