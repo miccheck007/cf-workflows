@@ -9,9 +9,12 @@ on:
     types: [opened, synchronize, reopened, closed]
   workflow_dispatch: # redeploy main, e.g. to ship a changed secret
 
+# The shared workflow's jobs ask for less: the job that runs this repo's code only gets contents: read.
 permissions:
   contents: read
-  id-token: write # only the shared workflow's deploy jobs use it, to ask the platform's broker for a token
+  id-token: write # deploy jobs only: to ask the platform's broker for a token
+  pull-requests: write # the production job's comment on the merged PR
+  deployments: write # marking a closed PR's preview deployments inactive
 
 jobs:
   worker:
